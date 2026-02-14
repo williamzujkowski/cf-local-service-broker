@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio-broker
+  labels:
+    app: minio-broker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio-broker
+  template:
+    metadata:
+      labels:
+        app: minio-broker
+    spec:
+      containers:
+        - name: minio-broker
+          image: minio-broker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            - name: MINIO_ENDPOINT
+              value: "minio.default.svc.cluster.local:9000"
+            - name: MINIO_USE_SSL
+              value: "false"
+          envFrom:
+            - secretRef:
+                name: minio-broker-creds
+          readinessProbe:
+            httpGet:
+              path: /v2/catalog
+              port: 8080
+              httpHeaders:
+                - name: X-Broker-API-Version
+                  value: "2.16"
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v2/catalog
+              port: 8080
+              httpHeaders:
+                - name: X-Broker-API-Version
+                  value: "2.16"
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "50m"
+            limits:
+              memory: "64Mi"
+              cpu: "100m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-broker
+  labels:
+    app: minio-broker
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: minio-broker
