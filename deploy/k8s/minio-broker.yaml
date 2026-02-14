@@ -32,22 +32,14 @@ spec:
             - secretRef:
                 name: minio-broker-creds
           readinessProbe:
-            httpGet:
-              path: /v2/catalog
+            tcpSocket:
               port: 8080
-              httpHeaders:
-                - name: X-Broker-API-Version
-                  value: "2.16"
-            initialDelaySeconds: 5
+            initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
-            httpGet:
-              path: /v2/catalog
+            tcpSocket:
               port: 8080
-              httpHeaders:
-                - name: X-Broker-API-Version
-                  value: "2.16"
-            initialDelaySeconds: 10
+            initialDelaySeconds: 5
             periodSeconds: 30
           resources:
             requests:
