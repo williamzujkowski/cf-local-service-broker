@@ -21,6 +21,20 @@ import (
 // Only allows alphanumeric characters and underscores.
 var identifierPattern = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
+// Service and plan IDs. Treat these as stable — changing them rebinds
+// every existing service instance against the broker.
+const (
+	ServiceID       = "postgresql-local-service-id"
+	SharedPlanID    = "postgresql-local-shared-plan-id"
+	PgvectorPlanID  = "postgresql-local-pgvector-plan-id"
+)
+
+// planUsesPgvector reports whether the given plan ID provisions databases
+// with the pgvector extension enabled.
+func planUsesPgvector(planID string) bool {
+	return planID == PgvectorPlanID
+}
+
 // Broker implements the domain.ServiceBroker interface for PostgreSQL.
 // It provisions databases and roles on a shared PostgreSQL instance.
 type Broker struct {
@@ -41,9 +55,16 @@ func New(host, port, adminUser, adminPass string) *Broker {
 }
 
 func (b *Broker) connectAdmin() (*sql.DB, error) {
+	return b.connectAdminDB("postgres")
+}
+
+// connectAdminDB opens an admin connection scoped to a specific database.
+// Used to run per-database DDL such as CREATE EXTENSION, which is not
+// reachable from the cluster's default `postgres` database.
+func (b *Broker) connectAdminDB(dbName string) (*sql.DB, error) {
 	connStr := fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=postgres sslmode=disable",
-		b.host, b.port, b.adminUser, b.adminPass,
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		b.host, b.port, b.adminUser, b.adminPass, dbName,
 	)
 	return sql.Open("postgres", connStr)
 }
@@ -86,33 +107,46 @@ func generatePassword(length int) (string, error) {
 func (b *Broker) Services(_ context.Context) ([]domain.Service, error) {
 	return []domain.Service{
 		{
-			ID:          "postgresql-local-service-id",
+			ID:          ServiceID,
 			Name:        "postgresql-local",
 			Description: "PostgreSQL database on a shared local instance",
 			Bindable:    true,
 			Tags:        []string{"postgresql", "sql", "database"},
 			Plans: []domain.ServicePlan{
 				{
-					ID:          "postgresql-local-shared-plan-id",
+					ID:          SharedPlanID,
 					Name:        "shared",
 					Description: "Creates a database on the shared PostgreSQL instance",
 					Free:        boolPtr(true),
+				},
+				{
+					ID:   PgvectorPlanID,
+					Name: "pgvector",
+					Description: "Creates a database with the pgvector extension enabled. " +
+						"Requires a pgvector-capable backing Postgres image " +
+						"(e.g., pgvector/pgvector:pg16).",
+					Free: boolPtr(true),
 				},
 			},
 			Metadata: &domain.ServiceMetadata{
 				DisplayName: "PostgreSQL (Local)",
 				LongDescription: "Provisions a dedicated database and credentials on a shared " +
-					"PostgreSQL instance running in the local cluster.",
+					"PostgreSQL instance running in the local cluster. " +
+					"The 'pgvector' plan additionally enables the pgvector extension " +
+					"on the new database.",
 			},
 		},
 	}, nil
 }
 
 // Provision creates a new database for the service instance.
+// For the pgvector plan, it additionally enables the pgvector extension
+// inside the new database. If extension creation fails, the empty
+// database is dropped so the caller can retry from a clean slate.
 func (b *Broker) Provision(
 	_ context.Context,
 	instanceID string,
-	_ domain.ProvisionDetails,
+	details domain.ProvisionDetails,
 	_ bool,
 ) (domain.ProvisionedServiceSpec, error) {
 	dbName := b.dbName(instanceID)
@@ -142,8 +176,36 @@ func (b *Broker) Provision(
 		return domain.ProvisionedServiceSpec{}, fmt.Errorf("failed to create database %s: %w", dbName, err)
 	}
 
-	log.Printf("Provisioned database: %s", dbName)
+	if planUsesPgvector(details.PlanID) {
+		if extErr := b.enablePgvectorExtension(dbName); extErr != nil {
+			// Best-effort cleanup so a retry doesn't trip ErrInstanceAlreadyExists.
+			if _, dropErr := db.Exec(fmt.Sprintf("DROP DATABASE %s", quoteIdentifier(dbName))); dropErr != nil {
+				log.Printf("Warning: failed to clean up database %s after pgvector setup failed: %v", dbName, dropErr)
+			}
+			return domain.ProvisionedServiceSpec{}, extErr
+		}
+	}
+
+	log.Printf("Provisioned database: %s (plan=%s)", dbName, details.PlanID)
 	return domain.ProvisionedServiceSpec{}, nil
+}
+
+// enablePgvectorExtension reconnects to the named database as admin and
+// runs CREATE EXTENSION IF NOT EXISTS vector. Requires the backing
+// PostgreSQL image to bundle the pgvector extension
+// (e.g., pgvector/pgvector:pg16). On a stock postgres image this will
+// fail with a clear "extension \"vector\" is not available" message.
+func (b *Broker) enablePgvectorExtension(dbName string) error {
+	db, err := b.connectAdminDB(dbName)
+	if err != nil {
+		return fmt.Errorf("failed to connect to %s for pgvector setup: %w", dbName, err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec("CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
+		return fmt.Errorf("failed to enable pgvector extension on %s: %w", dbName, err)
+	}
+	return nil
 }
 
 // Deprovision drops the database for the service instance.

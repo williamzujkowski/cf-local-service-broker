@@ -59,6 +59,7 @@ make register-minio BROKER_USERNAME=admin BROKER_PASSWORD=<password>
 ```bash
 # Create service instances
 cf create-service postgresql-local shared my-postgres
+cf create-service postgresql-local pgvector my-vector-db   # pgvector-enabled
 cf create-service minio-local shared my-minio
 
 # Bind to your app
@@ -73,9 +74,10 @@ cf restage my-app
 
 ### postgresql-local
 
-| Plan   | Description                                      |
-|--------|--------------------------------------------------|
-| shared | Creates a database and role on the shared instance |
+| Plan      | Description                                                                |
+|-----------|----------------------------------------------------------------------------|
+| shared    | Creates a database and role on the shared instance.                        |
+| pgvector  | As shared, plus `CREATE EXTENSION vector` on the new database. Requires a pgvector-capable backing image (see [pgvector backing image](#pgvector-backing-image)). |
 
 Binding credentials:
 ```json
@@ -105,6 +107,30 @@ Binding credentials:
   "use_ssl": false
 }
 ```
+
+## pgvector backing image
+
+The `pgvector` plan runs `CREATE EXTENSION IF NOT EXISTS vector` against
+each new database. That extension must be available in the backing
+PostgreSQL instance — stock `postgres:N` images do **not** ship it.
+
+Use a pgvector-capable image. The official one works:
+
+```yaml
+# k8s/postgres-statefulset.yaml (excerpt)
+spec:
+  template:
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg16   # or pg15, pg17 depending on your needs
+          # ... rest unchanged
+```
+
+If you push a `pgvector` plan against a stock postgres image, `Provision`
+returns a clear error (`extension "vector" is not available`) and the
+empty database is rolled back so a retry succeeds once the backing
+image is fixed.
 
 ## Architecture
 

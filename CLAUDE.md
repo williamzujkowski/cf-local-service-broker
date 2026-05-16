@@ -50,7 +50,9 @@ cf enable-service-access postgresql-local
 
 - `cmd/postgres-broker/` — Entry point for PostgreSQL broker
 - `cmd/minio-broker/` — Entry point for MinIO broker
-- `internal/broker/postgres/` — PostgreSQL broker implementation (`domain.ServiceBroker`)
+- `internal/broker/postgres/` — PostgreSQL broker implementation (`domain.ServiceBroker`).
+  Two plans: `shared` (database + role) and `pgvector` (also runs `CREATE EXTENSION vector`).
+  Pgvector plan requires a pgvector-capable backing image (e.g. `pgvector/pgvector:pg16`).
 - `internal/broker/minio/` — MinIO broker implementation (`domain.ServiceBroker`)
 - `deploy/k8s/` — Kubernetes deployment manifests
 
