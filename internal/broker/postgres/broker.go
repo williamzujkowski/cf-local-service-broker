@@ -294,6 +294,24 @@ func (b *Broker) Bind(
 		return domain.Binding{}, fmt.Errorf("failed to grant privileges: %w", err)
 	}
 
+	// Grant schema-level CREATE so the role can create tables. Postgres
+	// 15+ revoked CREATE on the `public` schema from PUBLIC, so a fresh
+	// role gets a permission-denied on `CREATE TABLE` without this.
+	// Has to run against the per-binding DB (schema permissions are
+	// per-database), not the admin DB we connected to above.
+	dbConn, err := b.connectAdminDB(dbName)
+	if err != nil {
+		return domain.Binding{}, fmt.Errorf("failed to connect to %s for schema grant: %w", dbName, err)
+	}
+	defer dbConn.Close()
+	_, err = dbConn.Exec(fmt.Sprintf(
+		"GRANT ALL ON SCHEMA public TO %s",
+		quoteIdentifier(roleName),
+	))
+	if err != nil {
+		return domain.Binding{}, fmt.Errorf("failed to grant schema public to %s: %w", roleName, err)
+	}
+
 	uri := fmt.Sprintf("postgres://%s:%s@%s:%s/%s",
 		roleName, password, b.host, b.port, dbName,
 	)
