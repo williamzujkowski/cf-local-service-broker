@@ -363,6 +363,34 @@ func (b *Broker) Unbind(
 		log.Printf("Warning: failed to revoke privileges for %s: %v", roleName, err)
 	}
 
+	// Reassign + drop objects owned by the role inside its DB. Without
+	// this, DROP ROLE fails with "cannot be dropped because some objects
+	// depend on it" whenever the bound app created tables/sequences/etc.
+	// REASSIGN preserves user data by transferring ownership to admin;
+	// DROP OWNED then removes the role's remaining grants (including the
+	// schema-public grant added in Bind).
+	// Ownership + privileges are per-DB, so connect to the per-binding DB.
+	if dbConn, dbErr := b.connectAdminDB(dbName); dbErr == nil {
+		defer dbConn.Close()
+		if _, e := dbConn.Exec(fmt.Sprintf(
+			"REASSIGN OWNED BY %s TO %s",
+			quoteIdentifier(roleName),
+			quoteIdentifier(b.adminUser),
+		)); e != nil {
+			log.Printf("Warning: REASSIGN OWNED for %s in %s failed: %v", roleName, dbName, e)
+		}
+		if _, e := dbConn.Exec(fmt.Sprintf(
+			"DROP OWNED BY %s",
+			quoteIdentifier(roleName),
+		)); e != nil {
+			log.Printf("Warning: DROP OWNED for %s in %s failed: %v", roleName, dbName, e)
+		}
+	} else {
+		// DB may have been deprovisioned ahead of this unbind. Continue
+		// to DROP ROLE — if the role owns no surviving objects, it works.
+		log.Printf("Warning: could not connect to %s during unbind: %v", dbName, dbErr)
+	}
+
 	// Drop the role
 	_, err = db.Exec(fmt.Sprintf("DROP ROLE IF EXISTS %s", quoteIdentifier(roleName)))
 	if err != nil {
