@@ -77,13 +77,13 @@ func TestPlanUsesPgvector(t *testing.T) {
 
 func TestSanitizeIdentifier(t *testing.T) {
 	cases := map[string]string{
-		"abc":                 "abc",
-		"abc-def":             "abc_def",
-		"my-instance-id-123":  "my_instance_id_123",
-		"bad;DROP TABLE":      "badDROPTABLE",
-		"a.b.c":               "abc",
-		"under_score_ok":      "under_score_ok",
-		"":                    "",
+		"abc":                "abc",
+		"abc-def":            "abc_def",
+		"my-instance-id-123": "my_instance_id_123",
+		"bad;DROP TABLE":     "badDROPTABLE",
+		"a.b.c":              "abc",
+		"under_score_ok":     "under_score_ok",
+		"":                   "",
 	}
 	for input, want := range cases {
 		if got := sanitizeIdentifier(input); got != want {
@@ -155,5 +155,66 @@ func TestDbNameAndRoleNamePrefixWithCF(t *testing.T) {
 	}
 	if got := b.roleName("xyz-456"); got != "cf_xyz_456" {
 		t.Errorf("roleName: got %q, want cf_xyz_456", got)
+	}
+}
+
+func TestOwnerRoleNameDerivesFromInstance(t *testing.T) {
+	b := New("h", "5432", "admin", "pw")
+
+	// Deterministic: same instance id -> same owner role.
+	first := b.ownerRoleName("abc-123")
+	second := b.ownerRoleName("abc-123")
+	if first != second {
+		t.Errorf("ownerRoleName not deterministic: %q vs %q", first, second)
+	}
+
+	// Suffix convention so operators can spot it in pg_roles.
+	if !strings.HasSuffix(first, "_owner") {
+		t.Errorf("ownerRoleName(%q)=%q should end with _owner", "abc-123", first)
+	}
+
+	// Sanity: prefix is the db name so the relationship is obvious.
+	if got, want := first, b.dbName("abc-123")+"_owner"; got != want {
+		t.Errorf("ownerRoleName(%q)=%q, want %q", "abc-123", got, want)
+	}
+
+	// Postgres identifier limit is 63 bytes — even with a worst-case CF
+	// UUID instance id we should stay under it.
+	worstCase := b.ownerRoleName("ffffffff-ffff-ffff-ffff-ffffffffffff")
+	if len(worstCase) > 63 {
+		t.Errorf("ownerRoleName for UUID is %d bytes (%q), exceeds Postgres NAMEDATALEN-1=63", len(worstCase), worstCase)
+	}
+
+	// Validates as a SQL identifier — the broker hands it straight to
+	// CREATE ROLE / ALTER DATABASE OWNER TO.
+	if err := validateIdentifier(worstCase); err != nil {
+		t.Errorf("ownerRoleName for UUID failed validateIdentifier: %v", err)
+	}
+}
+
+func TestNewDefaultsSharedOwnerOn(t *testing.T) {
+	// New() is the convenience constructor used by simple deploys; the
+	// shared-owner-role model should be ON by default per issue #10.
+	b := New("h", "5432", "admin", "pw")
+	if !b.sharedOwnerRole {
+		t.Errorf("New() should default sharedOwnerRole=true; got false")
+	}
+}
+
+func TestNewWithOptionsCarriesSharedOwnerFlag(t *testing.T) {
+	cases := []struct {
+		name string
+		in   bool
+	}{
+		{"on", true},
+		{"off", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := NewWithOptions("h", "5432", "admin", "pw", tc.in)
+			if b.sharedOwnerRole != tc.in {
+				t.Errorf("sharedOwnerRole: got %v, want %v", b.sharedOwnerRole, tc.in)
+			}
+		})
 	}
 }

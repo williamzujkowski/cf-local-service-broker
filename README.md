@@ -133,6 +133,29 @@ Binding credentials (host/port depend on where your backing PostgreSQL lives):
 }
 ```
 
+#### Shared owner role (multi-binding apps)
+
+By default, every service instance also gets a per-instance non-LOGIN
+group role named `cf_<instance_id>_owner`. The DB is owned by that role,
+and every Bind grants the binding role membership in it plus a
+`SET ROLE = <owner_role>` session default. Result: tables/sequences
+created from one binding (e.g. an API doing alembic migrations) are
+automatically owned by the shared role and are read/writable from any
+other binding against the same instance (e.g. a worker). No admin-level
+reconcile required.
+
+The `username` returned in binding credentials is still the per-binding
+login role — apps connect with their own creds; the shared-role
+inheritance happens server-side.
+
+To opt out (e.g. for in-place upgrades where you don't want to rebind
+existing instances), set `POSTGRES_BROKER_SHARED_OWNER_ROLE=false`. In
+that mode the broker behaves exactly as it did before this feature: per
+binding role only, DB owner stays as the admin role. Existing instances
+provisioned in opt-out mode keep working; rebinding them later under
+opt-in mode is not automatic — you'd need to deprovision/reprovision or
+do a one-time admin reconcile.
+
 ### minio-local
 
 | Plan   | Description                                   |
