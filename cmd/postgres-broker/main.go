@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 
 	"github.com/pivotal-cf/brokerapi/v11"
 	"github.com/williamzujkowski/cf-local-service-broker/internal/broker/postgres"
@@ -39,7 +40,22 @@ func main() {
 		log.Fatal("PG_ADMIN_PASSWORD must be set")
 	}
 
-	broker := postgres.New(pgHost, pgPort, pgUser, pgPass)
+	// POSTGRES_BROKER_SHARED_OWNER_ROLE controls the shared-owner-role
+	// model (issue #10). Defaults to true so multi-binding apps (API +
+	// worker) get cross-binding object access out of the box. Set to
+	// false for the legacy per-binding-only role behavior — useful for
+	// operators upgrading a broker who don't want to rebind existing
+	// service instances right away.
+	sharedOwner := true
+	if v := os.Getenv("POSTGRES_BROKER_SHARED_OWNER_ROLE"); v != "" {
+		parsed, perr := strconv.ParseBool(v)
+		if perr != nil {
+			log.Fatalf("POSTGRES_BROKER_SHARED_OWNER_ROLE: invalid bool %q: %v", v, perr)
+		}
+		sharedOwner = parsed
+	}
+
+	broker := postgres.NewWithOptions(pgHost, pgPort, pgUser, pgPass, sharedOwner)
 
 	credentials := brokerapi.BrokerCredentials{
 		Username: username,

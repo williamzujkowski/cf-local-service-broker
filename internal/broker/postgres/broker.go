@@ -24,9 +24,9 @@ var identifierPattern = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 // Service and plan IDs. Treat these as stable — changing them rebinds
 // every existing service instance against the broker.
 const (
-	ServiceID       = "postgresql-local-service-id"
-	SharedPlanID    = "postgresql-local-shared-plan-id"
-	PgvectorPlanID  = "postgresql-local-pgvector-plan-id"
+	ServiceID      = "postgresql-local-service-id"
+	SharedPlanID   = "postgresql-local-shared-plan-id"
+	PgvectorPlanID = "postgresql-local-pgvector-plan-id"
 )
 
 // planUsesPgvector reports whether the given plan ID provisions databases
@@ -38,19 +38,31 @@ func planUsesPgvector(planID string) bool {
 // Broker implements the domain.ServiceBroker interface for PostgreSQL.
 // It provisions databases and roles on a shared PostgreSQL instance.
 type Broker struct {
-	host     string
-	port     string
-	adminUser string
-	adminPass string
+	host            string
+	port            string
+	adminUser       string
+	adminPass       string
+	sharedOwnerRole bool
 }
 
-// New creates a new PostgreSQL service broker.
+// New creates a new PostgreSQL service broker with the shared-owner-role
+// model enabled. See NewWithOptions for the per-binding-only fallback.
 func New(host, port, adminUser, adminPass string) *Broker {
+	return NewWithOptions(host, port, adminUser, adminPass, true)
+}
+
+// NewWithOptions creates a new PostgreSQL service broker, allowing the
+// caller to disable the shared-owner-role model. When sharedOwnerRole is
+// false the broker falls back to the per-binding-only role behavior that
+// shipped before issue #10 — useful for operators upgrading an existing
+// broker who don't want to rebind every service instance immediately.
+func NewWithOptions(host, port, adminUser, adminPass string, sharedOwnerRole bool) *Broker {
 	return &Broker{
-		host:      host,
-		port:      port,
-		adminUser: adminUser,
-		adminPass: adminPass,
+		host:            host,
+		port:            port,
+		adminUser:       adminUser,
+		adminPass:       adminPass,
+		sharedOwnerRole: sharedOwnerRole,
 	}
 }
 
@@ -77,6 +89,17 @@ func (b *Broker) dbName(instanceID string) string {
 func (b *Broker) roleName(bindingID string) string {
 	safe := sanitizeIdentifier(bindingID)
 	return "cf_" + safe
+}
+
+// ownerRoleName derives the deterministic name of the per-instance
+// shared owner role used by the shared-owner-role model (issue #10).
+// Postgres identifiers are limited to 63 bytes; with the broker's
+// `cf_<sanitized-instance-id>` database name (typically 39 chars for a
+// UUID instance id) plus the `_owner` suffix (6 chars) we stay well
+// inside that bound. The suffix is appended directly to the dbName so
+// the relationship is obvious in pg_roles for an operator triaging.
+func (b *Broker) ownerRoleName(instanceID string) string {
+	return b.dbName(instanceID) + "_owner"
 }
 
 // sanitizeIdentifier replaces hyphens with underscores and removes any
@@ -140,9 +163,20 @@ func (b *Broker) Services(_ context.Context) ([]domain.Service, error) {
 }
 
 // Provision creates a new database for the service instance.
-// For the pgvector plan, it additionally enables the pgvector extension
-// inside the new database. If extension creation fails, the empty
-// database is dropped so the caller can retry from a clean slate.
+//
+// When the shared-owner-role model is enabled (issue #10) it also creates
+// a per-instance non-LOGIN group role (`<dbName>_owner`) and transfers
+// database ownership to it. Subsequent Bind() calls grant that group to
+// each per-binding login role and set it as their default current role so
+// every CREATE TABLE/ALTER ends up owned by the shared role — giving
+// multi-binding apps (API + worker) natural cross-binding object access.
+//
+// For the pgvector plan it additionally enables the pgvector extension
+// inside the new database. The extension is created BEFORE ownership
+// is transferred because CREATE EXTENSION must run as a superuser and
+// we connect as the admin user. If extension creation fails, the empty
+// database (and owner role, if created) are dropped so the caller can
+// retry from a clean slate.
 func (b *Broker) Provision(
 	_ context.Context,
 	instanceID string,
@@ -186,7 +220,47 @@ func (b *Broker) Provision(
 		}
 	}
 
-	log.Printf("Provisioned database: %s (plan=%s)", dbName, details.PlanID)
+	if b.sharedOwnerRole {
+		ownerRole := b.ownerRoleName(instanceID)
+		if err := validateIdentifier(ownerRole); err != nil {
+			// Roll back so retries see a clean slate.
+			if _, dropErr := db.Exec(fmt.Sprintf("DROP DATABASE %s", quoteIdentifier(dbName))); dropErr != nil {
+				log.Printf("Warning: failed to clean up database %s after owner role validation failed: %v", dbName, dropErr)
+			}
+			return domain.ProvisionedServiceSpec{}, fmt.Errorf("invalid owner role name: %w", err)
+		}
+
+		// NOLOGIN group role — bindings will be granted INTO it.
+		if _, err := db.Exec(fmt.Sprintf(
+			"CREATE ROLE %s NOLOGIN",
+			quoteIdentifier(ownerRole),
+		)); err != nil {
+			// Roll back the empty database so retry from clean slate works.
+			if _, dropErr := db.Exec(fmt.Sprintf("DROP DATABASE %s", quoteIdentifier(dbName))); dropErr != nil {
+				log.Printf("Warning: failed to clean up database %s after owner role creation failed: %v", dbName, dropErr)
+			}
+			return domain.ProvisionedServiceSpec{}, fmt.Errorf("failed to create shared owner role %s: %w", ownerRole, err)
+		}
+
+		// Transfer database ownership so the shared role owns the DB itself
+		// (and, transitively, schema-level defaults inherited from it).
+		if _, err := db.Exec(fmt.Sprintf(
+			"ALTER DATABASE %s OWNER TO %s",
+			quoteIdentifier(dbName),
+			quoteIdentifier(ownerRole),
+		)); err != nil {
+			// Roll back both the role and the DB.
+			if _, dropErr := db.Exec(fmt.Sprintf("DROP DATABASE %s", quoteIdentifier(dbName))); dropErr != nil {
+				log.Printf("Warning: failed to clean up database %s after ALTER OWNER failed: %v", dbName, dropErr)
+			}
+			if _, dropErr := db.Exec(fmt.Sprintf("DROP ROLE IF EXISTS %s", quoteIdentifier(ownerRole))); dropErr != nil {
+				log.Printf("Warning: failed to clean up owner role %s after ALTER OWNER failed: %v", ownerRole, dropErr)
+			}
+			return domain.ProvisionedServiceSpec{}, fmt.Errorf("failed to transfer ownership of %s to %s: %w", dbName, ownerRole, err)
+		}
+	}
+
+	log.Printf("Provisioned database: %s (plan=%s, shared_owner=%v)", dbName, details.PlanID, b.sharedOwnerRole)
 	return domain.ProvisionedServiceSpec{}, nil
 }
 
@@ -208,7 +282,12 @@ func (b *Broker) enablePgvectorExtension(dbName string) error {
 	return nil
 }
 
-// Deprovision drops the database for the service instance.
+// Deprovision drops the database for the service instance and, when the
+// shared-owner-role model is enabled, the per-instance owner role.
+//
+// Order matters: DROP DATABASE first so the objects owned by the shared
+// role go away with the DB, then DROP ROLE succeeds without needing
+// REASSIGN OWNED.
 func (b *Broker) Deprovision(
 	_ context.Context,
 	instanceID string,
@@ -241,11 +320,38 @@ func (b *Broker) Deprovision(
 		return domain.DeprovisionServiceSpec{}, fmt.Errorf("failed to drop database %s: %w", dbName, err)
 	}
 
-	log.Printf("Deprovisioned database: %s", dbName)
+	if b.sharedOwnerRole {
+		ownerRole := b.ownerRoleName(instanceID)
+		// Validate before interpolating into DDL.
+		if err := validateIdentifier(ownerRole); err != nil {
+			log.Printf("Warning: skipping shared owner role drop for instance %s: %v", instanceID, err)
+		} else if _, err := db.Exec(fmt.Sprintf(
+			"DROP ROLE IF EXISTS %s",
+			quoteIdentifier(ownerRole),
+		)); err != nil {
+			// Don't fail the deprovision — the DB is already gone. Worst
+			// case the operator cleans up a stray empty role manually.
+			log.Printf("Warning: failed to drop shared owner role %s: %v", ownerRole, err)
+		}
+	}
+
+	log.Printf("Deprovisioned database: %s (shared_owner=%v)", dbName, b.sharedOwnerRole)
 	return domain.DeprovisionServiceSpec{}, nil
 }
 
 // Bind creates a new role with access to the provisioned database and returns credentials.
+//
+// When the shared-owner-role model is enabled (issue #10) the per-binding
+// role is also granted membership in the per-instance shared owner role
+// (created in Provision) and has `SET ROLE = <owner>` set as a session
+// default. The practical effect: every DDL issued by an app on this
+// binding ends up owned by the shared role, so a second binding against
+// the same instance can read/write the same objects without an
+// admin-level reconcile.
+//
+// The returned credentials still name the per-binding role as `username`
+// — apps connect with their own creds; the shared-role inheritance
+// happens server-side via the ALTER ROLE SET ROLE default.
 func (b *Broker) Bind(
 	_ context.Context,
 	instanceID, bindingID string,
@@ -294,11 +400,48 @@ func (b *Broker) Bind(
 		return domain.Binding{}, fmt.Errorf("failed to grant privileges: %w", err)
 	}
 
+	if b.sharedOwnerRole {
+		ownerRole := b.ownerRoleName(instanceID)
+		if err := validateIdentifier(ownerRole); err != nil {
+			return domain.Binding{}, fmt.Errorf("invalid owner role name: %w", err)
+		}
+
+		// Bind inherits group membership in the shared owner. INHERIT is
+		// the default on CREATE ROLE so the binding immediately picks up
+		// any privileges held by the owner (notably: ownership of every
+		// object in the database).
+		if _, err := db.Exec(fmt.Sprintf(
+			"GRANT %s TO %s",
+			quoteIdentifier(ownerRole),
+			quoteIdentifier(roleName),
+		)); err != nil {
+			return domain.Binding{}, fmt.Errorf("failed to grant owner role %s to %s: %w", ownerRole, roleName, err)
+		}
+
+		// Auto-set role on login so every CREATE TABLE/ALTER TABLE the
+		// app issues defaults the object owner to the shared role —
+		// regardless of which binding's credentials the connection used.
+		// This is the property that makes multi-binding (API + worker)
+		// apps share an object graph without admin-level reconciles.
+		if _, err := db.Exec(fmt.Sprintf(
+			"ALTER ROLE %s SET ROLE = %s",
+			quoteIdentifier(roleName),
+			quoteIdentifier(ownerRole),
+		)); err != nil {
+			return domain.Binding{}, fmt.Errorf("failed to set default role on %s: %w", roleName, err)
+		}
+	}
+
 	// Grant schema-level CREATE so the role can create tables. Postgres
 	// 15+ revoked CREATE on the `public` schema from PUBLIC, so a fresh
 	// role gets a permission-denied on `CREATE TABLE` without this.
 	// Has to run against the per-binding DB (schema permissions are
 	// per-database), not the admin DB we connected to above.
+	//
+	// Kept as defense-in-depth even with shared-owner-role enabled:
+	// CREATE TABLE under the binding role's own identity (e.g. before
+	// SET ROLE takes effect, or if an app explicitly RESET ROLEs) still
+	// needs to work.
 	dbConn, err := b.connectAdminDB(dbName)
 	if err != nil {
 		return domain.Binding{}, fmt.Errorf("failed to connect to %s for schema grant: %w", dbName, err)
@@ -312,11 +455,25 @@ func (b *Broker) Bind(
 		return domain.Binding{}, fmt.Errorf("failed to grant schema public to %s: %w", roleName, err)
 	}
 
+	if b.sharedOwnerRole {
+		// Also grant schema-public to the shared owner so objects
+		// CREATEd under SET ROLE land in `public` cleanly. The owner
+		// already owns the database itself, but on Postgres 15+ that
+		// doesn't transitively grant CREATE on `public`.
+		ownerRole := b.ownerRoleName(instanceID)
+		if _, err := dbConn.Exec(fmt.Sprintf(
+			"GRANT ALL ON SCHEMA public TO %s",
+			quoteIdentifier(ownerRole),
+		)); err != nil {
+			return domain.Binding{}, fmt.Errorf("failed to grant schema public to owner %s: %w", ownerRole, err)
+		}
+	}
+
 	uri := fmt.Sprintf("postgres://%s:%s@%s:%s/%s",
 		roleName, password, b.host, b.port, dbName,
 	)
 
-	log.Printf("Created binding: role=%s database=%s", roleName, dbName)
+	log.Printf("Created binding: role=%s database=%s shared_owner=%v", roleName, dbName, b.sharedOwnerRole)
 
 	return domain.Binding{
 		Credentials: map[string]interface{}{
@@ -330,7 +487,16 @@ func (b *Broker) Bind(
 	}, nil
 }
 
-// Unbind drops the role created during binding.
+// Unbind drops the per-binding role created during Bind. The per-instance
+// shared owner role (when enabled) is intentionally left intact — it's
+// shared across every binding for the instance and is only removed by
+// Deprovision.
+//
+// With the shared-owner-role model on, most objects the bound app
+// created are already owned by the shared role (not the per-binding
+// role), so REASSIGN OWNED becomes mostly a no-op. We keep it for safety
+// — anything created with an explicit `RESET ROLE` would still be owned
+// by the per-binding role and block DROP ROLE without it.
 func (b *Broker) Unbind(
 	_ context.Context,
 	instanceID, bindingID string,
@@ -363,19 +529,41 @@ func (b *Broker) Unbind(
 		log.Printf("Warning: failed to revoke privileges for %s: %v", roleName, err)
 	}
 
+	// Revoke membership in the shared owner so the role has no remaining
+	// grants and DROP ROLE doesn't trip on "role ... is a member of role".
+	if b.sharedOwnerRole {
+		ownerRole := b.ownerRoleName(instanceID)
+		if vErr := validateIdentifier(ownerRole); vErr == nil {
+			if _, e := db.Exec(fmt.Sprintf(
+				"REVOKE %s FROM %s",
+				quoteIdentifier(ownerRole),
+				quoteIdentifier(roleName),
+			)); e != nil {
+				log.Printf("Warning: REVOKE owner %s FROM %s failed: %v", ownerRole, roleName, e)
+			}
+		}
+	}
+
 	// Reassign + drop objects owned by the role inside its DB. Without
 	// this, DROP ROLE fails with "cannot be dropped because some objects
 	// depend on it" whenever the bound app created tables/sequences/etc.
-	// REASSIGN preserves user data by transferring ownership to admin;
-	// DROP OWNED then removes the role's remaining grants (including the
-	// schema-public grant added in Bind).
+	// REASSIGN preserves user data by transferring ownership to admin
+	// (or, with shared-owner-role enabled, to the per-instance owner so
+	// the next binding still sees it); DROP OWNED then removes the
+	// role's remaining grants (including the schema-public grant added
+	// in Bind).
+	//
 	// Ownership + privileges are per-DB, so connect to the per-binding DB.
 	if dbConn, dbErr := b.connectAdminDB(dbName); dbErr == nil {
 		defer dbConn.Close()
+		reassignTo := b.adminUser
+		if b.sharedOwnerRole {
+			reassignTo = b.ownerRoleName(instanceID)
+		}
 		if _, e := dbConn.Exec(fmt.Sprintf(
 			"REASSIGN OWNED BY %s TO %s",
 			quoteIdentifier(roleName),
-			quoteIdentifier(b.adminUser),
+			quoteIdentifier(reassignTo),
 		)); e != nil {
 			log.Printf("Warning: REASSIGN OWNED for %s in %s failed: %v", roleName, dbName, e)
 		}
@@ -397,7 +585,7 @@ func (b *Broker) Unbind(
 		return domain.UnbindSpec{}, fmt.Errorf("failed to drop role %s: %w", roleName, err)
 	}
 
-	log.Printf("Removed binding: role=%s database=%s", roleName, dbName)
+	log.Printf("Removed binding: role=%s database=%s (shared owner %s left intact)", roleName, dbName, b.ownerRoleName(instanceID))
 	return domain.UnbindSpec{}, nil
 }
 
