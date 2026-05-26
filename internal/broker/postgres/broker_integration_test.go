@@ -19,6 +19,10 @@
 //	TestUnbindLeavesSharedOwnerIntact            — unbind drops only the per-binding role
 //	TestDeprovisionRemovesSharedOwnerRole        — full cleanup
 //	TestSharedOwnerFlagOffFallsBackToPerBinding  — feature flag opt-out preserved
+//	TestUpgradeFromV01xUnbindDeprovisionTolerant — #12: instances provisioned
+//	                                              without an owner role still
+//	                                              clean up after the broker
+//	                                              upgrade flips the flag on
 package postgres
 
 import (
@@ -373,5 +377,131 @@ func TestSharedOwnerFlagOffFallsBackToPerBinding(t *testing.T) {
 	}
 	if memberships != 0 {
 		t.Errorf("legacy mode: per-binding role %s should have no group memberships, got %d", bindRole, memberships)
+	}
+}
+
+// TestUpgradeFromV01xUnbindDeprovisionTolerant simulates the upgrade path
+// from #12: a service instance was provisioned under v0.1.x (no shared
+// owner role exists for it) and the broker is then upgraded to v0.2.0
+// (sharedOwnerRole=true). Subsequent Unbind + Deprovision MUST NOT trip
+// on the missing owner role — that's the bug.
+//
+// We simulate the v0.1.x provision by constructing a Broker with
+// sharedOwnerRole=false, provisioning + binding, then swapping in a
+// fresh Broker with sharedOwnerRole=true to drive Unbind + Deprovision.
+func TestUpgradeFromV01xUnbindDeprovisionTolerant(t *testing.T) {
+	// Phase 1: v0.1.x broker provisions + binds — no owner role is
+	// ever created.
+	legacy, adminUser := brokerFromDSN(t, false)
+	ctx := context.Background()
+
+	instanceID := newInstanceID("upgrade")
+	bindingID := newInstanceID("upgradeb")
+	dbName := legacy.dbName(instanceID)
+	bindRole := legacy.roleName(bindingID)
+	ownerRole := legacy.ownerRoleName(instanceID)
+
+	if _, err := legacy.Provision(ctx, instanceID, domain.ProvisionDetails{PlanID: SharedPlanID}, false); err != nil {
+		t.Fatalf("legacy Provision failed: %v", err)
+	}
+	// Belt-and-suspenders: if anything below leaves the DB or roles
+	// behind, the cleanup hook tears them down so subsequent test runs
+	// aren't fouled. Both brokers' Deprovision is idempotent.
+	t.Cleanup(func() {
+		_, _ = legacy.Deprovision(ctx, instanceID, domain.DeprovisionDetails{}, false)
+	})
+
+	if _, err := legacy.Bind(ctx, instanceID, bindingID, domain.BindDetails{}, false); err != nil {
+		t.Fatalf("legacy Bind failed: %v", err)
+	}
+
+	admin, err := legacy.connectAdmin()
+	if err != nil {
+		t.Fatalf("connectAdmin: %v", err)
+	}
+	defer admin.Close()
+
+	// Precondition: db + binding role exist, owner role does NOT.
+	if !dbExists(t, admin, dbName) {
+		t.Fatalf("precondition: legacy provision should have created db %s", dbName)
+	}
+	if !roleExists(t, admin, bindRole) {
+		t.Fatalf("precondition: legacy bind should have created role %s", bindRole)
+	}
+	if roleExists(t, admin, ownerRole) {
+		t.Fatalf("precondition: legacy provision should NOT have created owner role %s", ownerRole)
+	}
+	if got := dbOwner(t, admin, dbName); got != adminUser {
+		t.Fatalf("precondition: legacy db owner should be admin (%s), got %q", adminUser, got)
+	}
+
+	// Drive a real CREATE TABLE under the binding role inside the bound
+	// DB so the unbind path has non-trivial owned objects to REASSIGN —
+	// this is what surfaces the bug in production (REASSIGN OWNED ...
+	// TO <missing-owner-role>). We use SET ROLE from an admin
+	// connection scoped to the per-binding DB so we don't have to fish
+	// the binding's password out of legacy.Bind (which doesn't return
+	// it to us in this flow). database.sql pools connections, so we
+	// pin a single conn for the SET ROLE / CREATE TABLE / RESET ROLE
+	// sequence — otherwise the SET wouldn't see the CREATE.
+	adminInDB, err := legacy.connectAdminDB(dbName)
+	if err != nil {
+		t.Fatalf("connectAdminDB(%s): %v", dbName, err)
+	}
+	defer adminInDB.Close()
+	conn, err := adminInDB.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquire pinned conn for SET ROLE: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`SET ROLE %s`, quoteIdentifier(bindRole))); err != nil {
+		t.Fatalf("SET ROLE %s in db: %v", bindRole, err)
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE legacy_owned_table (id INT PRIMARY KEY)"); err != nil {
+		t.Fatalf("CREATE TABLE under bind role: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "RESET ROLE"); err != nil {
+		t.Fatalf("RESET ROLE: %v", err)
+	}
+
+	// Phase 2: upgrade — fresh Broker with sharedOwnerRole=true, same
+	// underlying instance. This is the v0.2.0 broker driving cleanup on
+	// a v0.1.x instance.
+	upgraded, _ := brokerFromDSN(t, true)
+
+	// Unbind must NOT error on missing owner role.
+	if _, err := upgraded.Unbind(ctx, instanceID, bindingID, domain.UnbindDetails{}, false); err != nil {
+		t.Fatalf("v0.2.0 Unbind of v0.1.x binding failed (this is the #12 bug): %v", err)
+	}
+
+	// Binding role should be gone…
+	if roleExists(t, admin, bindRole) {
+		t.Errorf("per-binding role %s should be gone after Unbind", bindRole)
+	}
+	// …and the table it owned should have been REASSIGNed to admin
+	// (v0.1.x fallback), not to a nonexistent owner role.
+	var tableOwner string
+	if err := adminInDB.QueryRow(`SELECT tableowner FROM pg_tables WHERE tablename = 'legacy_owned_table'`).Scan(&tableOwner); err != nil {
+		t.Fatalf("table owner lookup post-unbind: %v", err)
+	}
+	if tableOwner != adminUser {
+		t.Errorf("legacy_owned_table owner post-unbind: got %q, want %q (v0.1.x fallback should REASSIGN to admin)", tableOwner, adminUser)
+	}
+
+	// Deprovision must succeed even though the owner role doesn't exist.
+	if _, err := upgraded.Deprovision(ctx, instanceID, domain.DeprovisionDetails{}, false); err != nil {
+		t.Fatalf("v0.2.0 Deprovision of v0.1.x instance failed (this is the #12 bug): %v", err)
+	}
+
+	// Final state: db is gone, binding role is gone, owner role still
+	// doesn't exist (and didn't get created spuriously).
+	if dbExists(t, admin, dbName) {
+		t.Errorf("database %s should be gone after Deprovision", dbName)
+	}
+	if roleExists(t, admin, bindRole) {
+		t.Errorf("binding role %s should be gone after full teardown", bindRole)
+	}
+	if roleExists(t, admin, ownerRole) {
+		t.Errorf("owner role %s should not exist (never created); got it back somehow", ownerRole)
 	}
 }

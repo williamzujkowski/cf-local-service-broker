@@ -81,6 +81,18 @@ func (b *Broker) connectAdminDB(dbName string) (*sql.DB, error) {
 	return sql.Open("postgres", connStr)
 }
 
+// roleExists returns true if the named PG role exists. Used to gate
+// v0.2.0 shared-owner code paths so instances provisioned under v0.1.x
+// (which have no owner role) can still be unbound/deprovisioned cleanly.
+func (b *Broker) roleExists(db *sql.DB, role string) (bool, error) {
+	var exists bool
+	err := db.QueryRow(
+		"SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)",
+		role,
+	).Scan(&exists)
+	return exists, err
+}
+
 func (b *Broker) dbName(instanceID string) string {
 	safe := sanitizeIdentifier(instanceID)
 	return "cf_" + safe
@@ -325,6 +337,20 @@ func (b *Broker) Deprovision(
 		// Validate before interpolating into DDL.
 		if err := validateIdentifier(ownerRole); err != nil {
 			log.Printf("Warning: skipping shared owner role drop for instance %s: %v", instanceID, err)
+		} else if exists, rErr := b.roleExists(db, ownerRole); rErr != nil {
+			// Probe failed — fall through to DROP ROLE IF EXISTS, which
+			// is itself a no-op if the role isn't there.
+			log.Printf("Warning: roleExists check for %s failed; attempting DROP ROLE IF EXISTS anyway: %v", ownerRole, rErr)
+			if _, err := db.Exec(fmt.Sprintf(
+				"DROP ROLE IF EXISTS %s",
+				quoteIdentifier(ownerRole),
+			)); err != nil {
+				log.Printf("Warning: failed to drop shared owner role %s: %v", ownerRole, err)
+			}
+		} else if !exists {
+			// v0.1.x-provisioned instance (#12) — no owner role was ever
+			// created, so there's nothing to drop. Skip cleanly.
+			log.Printf("INFO: owner role %s not found at Deprovision; v0.1.x compatibility path (nothing to drop)", ownerRole)
 		} else if _, err := db.Exec(fmt.Sprintf(
 			"DROP ROLE IF EXISTS %s",
 			quoteIdentifier(ownerRole),
@@ -529,18 +555,38 @@ func (b *Broker) Unbind(
 		log.Printf("Warning: failed to revoke privileges for %s: %v", roleName, err)
 	}
 
+	// Decide whether to use the v0.2.0 shared-owner path or the v0.1.x
+	// compatibility fallback. The fallback exists because an operator who
+	// upgraded the broker from v0.1.x to v0.2.0 still has instances on
+	// disk that were provisioned WITHOUT a shared owner role (see #12).
+	// Unconditionally REVOKE/REASSIGN to the owner errors out and leaves
+	// the binding/instance in a stuck state. Probing pg_roles up front
+	// lets us pick the right path per-instance.
+	useSharedOwner := false
+	ownerRole := ""
+	if b.sharedOwnerRole {
+		ownerRole = b.ownerRoleName(instanceID)
+		if vErr := validateIdentifier(ownerRole); vErr != nil {
+			log.Printf("Warning: shared owner role name %s failed validation; using v0.1.x compatibility path: %v", ownerRole, vErr)
+		} else if exists, rErr := b.roleExists(db, ownerRole); rErr != nil {
+			log.Printf("Warning: roleExists check for %s failed; using v0.1.x compatibility path: %v", ownerRole, rErr)
+		} else if exists {
+			useSharedOwner = true
+		} else {
+			log.Printf("INFO: owner role %s not found; using v0.1.x compatibility path", ownerRole)
+		}
+	}
+
 	// Revoke membership in the shared owner so the role has no remaining
 	// grants and DROP ROLE doesn't trip on "role ... is a member of role".
-	if b.sharedOwnerRole {
-		ownerRole := b.ownerRoleName(instanceID)
-		if vErr := validateIdentifier(ownerRole); vErr == nil {
-			if _, e := db.Exec(fmt.Sprintf(
-				"REVOKE %s FROM %s",
-				quoteIdentifier(ownerRole),
-				quoteIdentifier(roleName),
-			)); e != nil {
-				log.Printf("Warning: REVOKE owner %s FROM %s failed: %v", ownerRole, roleName, e)
-			}
+	// Only meaningful when the owner role actually exists.
+	if useSharedOwner {
+		if _, e := db.Exec(fmt.Sprintf(
+			"REVOKE %s FROM %s",
+			quoteIdentifier(ownerRole),
+			quoteIdentifier(roleName),
+		)); e != nil {
+			log.Printf("Warning: REVOKE owner %s FROM %s failed: %v", ownerRole, roleName, e)
 		}
 	}
 
@@ -548,17 +594,17 @@ func (b *Broker) Unbind(
 	// this, DROP ROLE fails with "cannot be dropped because some objects
 	// depend on it" whenever the bound app created tables/sequences/etc.
 	// REASSIGN preserves user data by transferring ownership to admin
-	// (or, with shared-owner-role enabled, to the per-instance owner so
-	// the next binding still sees it); DROP OWNED then removes the
-	// role's remaining grants (including the schema-public grant added
-	// in Bind).
+	// (or, with shared-owner-role enabled AND the owner role actually
+	// present, to the per-instance owner so the next binding still sees
+	// it); DROP OWNED then removes the role's remaining grants
+	// (including the schema-public grant added in Bind).
 	//
 	// Ownership + privileges are per-DB, so connect to the per-binding DB.
 	if dbConn, dbErr := b.connectAdminDB(dbName); dbErr == nil {
 		defer dbConn.Close()
 		reassignTo := b.adminUser
-		if b.sharedOwnerRole {
-			reassignTo = b.ownerRoleName(instanceID)
+		if useSharedOwner {
+			reassignTo = ownerRole
 		}
 		if _, e := dbConn.Exec(fmt.Sprintf(
 			"REASSIGN OWNED BY %s TO %s",
@@ -585,7 +631,11 @@ func (b *Broker) Unbind(
 		return domain.UnbindSpec{}, fmt.Errorf("failed to drop role %s: %w", roleName, err)
 	}
 
-	log.Printf("Removed binding: role=%s database=%s (shared owner %s left intact)", roleName, dbName, b.ownerRoleName(instanceID))
+	if useSharedOwner {
+		log.Printf("Removed binding: role=%s database=%s (shared owner %s left intact)", roleName, dbName, ownerRole)
+	} else {
+		log.Printf("Removed binding: role=%s database=%s (no shared owner — v0.1.x compatibility path)", roleName, dbName)
+	}
 	return domain.UnbindSpec{}, nil
 }
 
