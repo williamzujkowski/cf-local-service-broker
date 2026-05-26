@@ -156,6 +156,14 @@ provisioned in opt-out mode keep working; rebinding them later under
 opt-in mode is not automatic — you'd need to deprovision/reprovision or
 do a one-time admin reconcile.
 
+Unbind and Deprovision are tolerant of either provisioning mode: if the
+expected per-instance owner role isn't present (e.g. the instance was
+provisioned by an older broker before the shared-owner-role feature
+shipped), the broker falls back to the legacy behavior — REASSIGN OWNED
+to the admin role on Unbind and skip the owner DROP ROLE on
+Deprovision — so a `cf delete-service` against a legacy instance still
+cleans up cleanly after an in-place broker upgrade.
+
 ### minio-local
 
 | Plan   | Description                                   |
